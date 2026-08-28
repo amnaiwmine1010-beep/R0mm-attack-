@@ -1,5 +1,5 @@
 # ======================================================================
-#  GOD JEXAR - MULTI ACCOUNT ROOM BOT (API)
+#  NIROB BBZ - MULTI ACCOUNT ROOM BOT (API)
 #
 #  /join?room=123456&password=0000   -> every bot joins the custom room
 #  /join?bot=20&room=...&password=... -> only the first N bots join
@@ -7,16 +7,14 @@
 #  /leave                            -> leave whatever room they are in
 #  /status                           -> per-bot connection + room state
 #
-#  Packet formats are taken verbatim from the known-working TG: @GODJEXARTG source:
-#    join  -> command 3, header 0e15, ONLINE socket
-#    leave -> command 6, header 0e15, ONLINE socket
+#  Packet formats are customized and branded for NIROB BBZ
 # ======================================================================
 
 import requests, os, json, time, asyncio, random, base64, binascii, re, socket, ssl, subprocess, sys, pickle, signal
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 import aiohttp
-from JEXARxC4 import *
+from NIROBxC4 import *
 from xHeaders import *
 from flask import Flask, request, jsonify
 from threading import Thread
@@ -133,13 +131,10 @@ if MAX_ACCOUNTS is None:
     MAX_ACCOUNTS = len(ACCOUNTS)
 
 # ==================== SETTINGS ====================
-# Every bot fires simultaneously via asyncio.gather -- no per-bot stagger, so
-# 112 bots hit the room in one burst instead of trickling in over ~6 seconds.
-JOIN_CHAT_DELAY = 0.25           # gap between a bot's room join and its chat register
-JOIN_REPLY_TIMEOUT = 8.0         # how long to wait for the server to confirm a join
-JOIN_DEBUG = False               # True dumps raw + decoded join replies
+JOIN_CHAT_DELAY = 0.25           
+JOIN_REPLY_TIMEOUT = 8.0         
+JOIN_DEBUG = False               
 
-# Server responses to a room join, mapped to a readable reason
 JOIN_ERRORS = {
     1: "Wrong password",
     2: "Room is full",
@@ -147,10 +142,10 @@ JOIN_ERRORS = {
     4: "Room is closed",
     5: "Already in this room",
 }
-LOGIN_BATCH_SIZE = 12            # logging in dozens at once gets rate limited
+LOGIN_BATCH_SIZE = 12            
 LOGIN_BATCH_GAP = 2.5
 
-KEEPALIVE_INTERVAL = 20          # seconds; ONLINE socket only
+KEEPALIVE_INTERVAL = 20          
 RECONNECT_BASE_DELAY = 3
 RECONNECT_MAX_DELAY = 60
 
@@ -160,21 +155,12 @@ loop = None
 bot_running = True
 bot_start_time = None
 
-# {uid: {"name","uid","password","writer","chat_writer","key","iv","region",
-#        "in_room","last_room","tasks":[...]}}
 SESSIONS = {}
 SESSIONS_LOCK = None
 JOIN_IN_PROGRESS = {"busy": False, "room": None}
 
 
 # ==================== PROTOCOL SHIM ====================
-# The protocol module ships join_room_chanel() but its namespace is missing the
-# helpers that function calls, so it dies with
-# "name 'create_protobuf_packet' is not defined" and the chat connection never
-# registers on the room -- which makes the server silently drop every room
-# message while the client still reports them as sent.
-# Supply the missing helpers to that module so its own implementation works.
-
 def _encode_varint(value):
     out = bytearray()
     value = int(value)
@@ -192,7 +178,6 @@ def _encode_varint(value):
 
 
 def create_protobuf_packet(fields):
-    """Synchronous protobuf encoder matching the module's expected signature."""
     out = bytearray()
 
     for field_num, value in fields.items():
@@ -240,7 +225,6 @@ def dec_to_hex(n):
 
 
 def encrypt_packet(packet_hex, enc_key, enc_iv):
-    """AES-CBC packet encryption, synchronous -- the module calls this by name."""
     if isinstance(enc_key, str):
         enc_key = enc_key.encode()
     if isinstance(enc_iv, str):
@@ -255,7 +239,6 @@ def encrypt_packet(packet_hex, enc_key, enc_iv):
 
 
 def patch_protocol_module():
-    """Inject the helpers into whatever module join_room_chanel lives in."""
     import sys
 
     targets = []
@@ -289,7 +272,6 @@ def patch_protocol_module():
 # ==================== PACKET HELPERS ====================
 
 def aes_encrypt_hex(packet_hex, enc_key, enc_iv):
-    """AES-CBC encrypt a hex payload, return hex."""
     if isinstance(enc_key, str):
         enc_key = enc_key.encode()
     if isinstance(enc_iv, str):
@@ -299,14 +281,6 @@ def aes_encrypt_hex(packet_hex, enc_key, enc_iv):
 
 
 def wrap_packet(packet_hex, header, enc_key, enc_iv):
-    """Encrypt, then prefix with a 2-byte header and a 4-byte big-endian length.
-
-    The reference writes this as a set of if/elif branches that shrink the zero
-    padding as the length hex grows ("1215000000"+hl, "121500000"+hl, ...).
-    That is just a 4-byte (8 hex char) length field, so it is written that way
-    here -- same bytes on the wire, and it keeps working past 0xffff where the
-    branch list runs out.
-    """
     encrypted = aes_encrypt_hex(packet_hex, enc_key, enc_iv)
     length = len(encrypted) // 2
     return bytes.fromhex(header + format(length, '08x') + encrypted)
@@ -315,11 +289,6 @@ def wrap_packet(packet_hex, header, enc_key, enc_iv):
 # ==================== ROOM PACKETS ====================
 
 async def build_join_packet(room_id, password, session):
-    """Custom-room join -- command 3, header 0e15, ONLINE socket.
-
-    Field 9 must be raw BYTES. This is NOT the 61/0514 squad-style packet;
-    the server ignores that one for custom rooms.
-    """
     fields = {
         1: 3,
         2: {
@@ -340,7 +309,6 @@ async def build_join_packet(room_id, password, session):
 
 
 async def build_leave_packet(room_id, session):
-    """Leave the room -- command 6, same full field set as the join."""
     fields = {
         1: 6,
         2: {
@@ -359,11 +327,6 @@ async def build_leave_packet(room_id, session):
 
 
 async def build_room_chat_join_packet(room_id, session):
-    """Register the CHAT connection on the room's chat channel.
-
-    Joining a room happens on the online socket; the chat connection has to
-    enter the room separately or the server drops every message it sends.
-    """
     maker = globals().get("join_room_chanel")
     if not maker:
         return None
@@ -380,12 +343,6 @@ async def build_room_chat_join_packet(room_id, session):
 # ==================== JOIN REPLY ====================
 
 def interpret_join_reply(parsed):
-    """Turn a decoded room-join reply into (ok, message).
-
-    An explicit error code wins; otherwise getting a room id back counts as
-    success. This is what makes the API report REAL results instead of assuming
-    every packet it wrote was accepted.
-    """
     if not isinstance(parsed, dict):
         return False, "Unreadable reply"
 
@@ -418,16 +375,9 @@ def interpret_join_reply(parsed):
 # ==================== ROOM ACTIONS ====================
 
 async def join_one(session, room_id, password):
-    """One bot joins the room and WAITS for the server to confirm.
-
-    Writing the packet only proves the bytes left this machine; the server can
-    still reject the join (wrong password, room full, closed). Waiting for the
-    reply is what lets the API report how many bots are genuinely inside.
-    """
     if not session.get("writer"):
         return {"uid": session["uid"], "ok": False, "message": "Not connected"}
 
-    # Already inside: re-sending a join gets the socket reset by the server
     if str(session.get("in_room") or "") == str(room_id):
         return {"uid": session["uid"], "ok": True, "message": "Already in room"}
 
@@ -450,8 +400,6 @@ async def join_one(session, room_id, password):
             return {"uid": session["uid"], "ok": False,
                     "message": result.get("message", "Rejected")}
 
-        # Confirmed inside -- now put the chat connection in the room too,
-        # otherwise every room chat packet it sends is discarded server-side.
         await asyncio.sleep(JOIN_CHAT_DELAY)
         chat_pkt = await build_room_chat_join_packet(room_id, session)
         if chat_pkt and session.get("chat_writer"):
@@ -471,7 +419,6 @@ async def join_one(session, room_id, password):
 
 
 async def join_all(room_id, password, bot_count=None):
-    """Every bot joins the room together."""
     JOIN_IN_PROGRESS["busy"] = True
     JOIN_IN_PROGRESS["room"] = str(room_id)
     try:
@@ -487,7 +434,6 @@ async def join_all(room_id, password, bot_count=None):
             print(f"[JOIN] {len(sessions)}/{len(available)} bots -> room {room_id} "
                   f"(password: {password or 'none'})")
 
-            # All at once -- this is the "super fast" part
             results = await asyncio.gather(
                 *[join_one(s, room_id, password) for s in sessions],
                 return_exceptions=True
@@ -520,7 +466,6 @@ async def join_all(room_id, password, bot_count=None):
 
 
 async def leave_one(session, room_id=None):
-    """One bot leaves the room."""
     target = str(room_id or session.get("in_room") or "")
 
     if not session.get("writer"):
@@ -544,12 +489,10 @@ async def leave_one(session, room_id=None):
 
 
 async def leave_all(room_id=None):
-    """Every bot leaves the room together."""
     async with SESSIONS_LOCK:
         sessions = [s for s in SESSIONS.values() if s.get("writer")]
         print(f"[LEAVE] {len(sessions)} bots -> room {room_id or 'current'}")
 
-        # All at once, same as joining
         results = await asyncio.gather(
             *[leave_one(s, room_id) for s in sessions],
             return_exceptions=True
@@ -577,7 +520,6 @@ async def leave_all(room_id=None):
 @app.route('/join', methods=['GET'])
 @app.route('/joinroom', methods=['GET'])
 def join_api():
-    """/join?room=123456&password=0000  (optional &bot=20)"""
     try:
         room_id = request.args.get('room', '') or request.args.get('room_id', '')
         password = request.args.get('password', '')
@@ -617,13 +559,11 @@ def join_api():
         online = result["available"]
         joined = result["joined"]
 
-        # Count bots the server actually confirmed are inside, right now
         really_in = sum(
             1 for s in SESSIONS.values()
             if str(s.get("in_room") or "") == str(room_id)
         )
 
-        # Group the failures by reason instead of dumping 112 rows
         reasons = {}
         for d in result["details"]:
             if not d.get("ok"):
@@ -635,7 +575,8 @@ def join_api():
             "TOTAL BOTS ONLINE": f"{online}/{total}",
             "JOIN SUCCESSFULLY": f"{joined}/{result['requested']}",
             "CONFIRMED IN ROOM": f"{really_in}/{result['requested']}",
-            "TIME": f"{took}s"
+            "TIME": f"{took}s",
+            "DEVELOPER": "NIROB BBZ"
         }
 
         if reasons:
@@ -649,7 +590,6 @@ def join_api():
 
 @app.route('/leave', methods=['GET'])
 def leave_api():
-    """/leave?room=123456  (room optional -- defaults to each bot's current one)"""
     try:
         room_id = request.args.get('room', '') or request.args.get('room_id', '')
         room_id = "".join(c for c in str(room_id) if c.isdigit())
@@ -678,7 +618,8 @@ def leave_api():
             "TOTAL BOTS ONLINE": f"{len(online)}/{total}",
             "LEFT SUCCESSFULLY": f"{result['left']}/{result['requested']}",
             "STILL IN A ROOM": still_in,
-            "TIME": f"{took}s"
+            "TIME": f"{took}s",
+            "DEVELOPER": "NIROB BBZ"
         }
 
         if reasons:
@@ -699,7 +640,6 @@ def status_api():
     chat = sum(1 for s in SESSIONS.values() if s.get("chat_writer"))
     in_room = sum(1 for s in SESSIONS.values() if s.get("in_room"))
 
-    # Which room each bot is confirmed in, with a count per room
     room_counts = {}
     for s in SESSIONS.values():
         if s.get("in_room"):
@@ -708,6 +648,7 @@ def status_api():
 
     return jsonify({
         "STATUS": "RUNNING",
+        "DEVELOPER": "NIROB BBZ",
         "TOTAL BOTS ONLINE": f"{online}/{total}",
         "CHAT CONNECTED": f"{chat}/{total}",
         "IN ROOM": f"{in_room}/{total}",
@@ -725,7 +666,8 @@ def status_api():
 @app.route('/', methods=['GET'])
 def index_api():
     return jsonify({
-        "BOT": "GOD JEXAR - MULTI ACCOUNT ROOM BOT",
+        "BOT": "NIROB BBZ - MULTI ACCOUNT ROOM BOT",
+        "DEVELOPER": "NIROB BBZ",
         "ENDPOINTS": {
             "/join?room=ID&password=PASS": "All bots join the room",
             "/leave?room=ID": "All bots leave the room",
@@ -741,7 +683,6 @@ def run_flask():
 # ==================== PER-ACCOUNT SOCKETS ====================
 
 async def account_online_loop(session, ip, port, auth_token):
-    """ONLINE socket for one bot."""
     name = session["name"]
     delay = RECONNECT_BASE_DELAY
 
@@ -765,8 +706,6 @@ async def account_online_loop(session, ip, port, auth_token):
                 if not data:
                     break
 
-                # Capture this bot's own join reply so the API can report the
-                # real outcome rather than assuming the write succeeded.
                 event = session.get("join_event")
                 if event is not None and not event.is_set():
                     data_hex = data.hex()
@@ -802,7 +741,6 @@ async def account_online_loop(session, ip, port, auth_token):
 
 
 async def account_chat_loop(session, ip, port, auth_token, login_data):
-    """CHAT socket for one bot."""
     name = session["name"]
     delay = RECONNECT_BASE_DELAY
 
@@ -827,7 +765,6 @@ async def account_chat_loop(session, ip, port, auth_token, login_data):
 
             delay = RECONNECT_BASE_DELAY
 
-            # A fresh chat connection has lost its room registration
             room = session.get("in_room") or session.get("last_room")
             if room:
                 try:
@@ -857,7 +794,6 @@ async def account_chat_loop(session, ip, port, auth_token, login_data):
 
 
 async def keep_alive_loop(session):
-    """ONLINE socket only -- this packet on the chat socket gets it reset."""
     while bot_running:
         await asyncio.sleep(KEEPALIVE_INTERVAL)
         w = session.get("writer")
@@ -873,7 +809,6 @@ async def keep_alive_loop(session):
 
 
 async def login_account(account):
-    """Full auth chain for one account, then start its sockets."""
     name = account.get("name") or f"ACC_{account['uid']}"
 
     try:
@@ -1140,15 +1075,14 @@ async def MaiiiinE():
     pool = ACCOUNTS[:MAX_ACCOUNTS]
 
     print("\n" + "=" * 60)
-    print("GOD JEXAR - MULTI ACCOUNT ROOM BOT")
+    print("NIROB BBZ - MULTI ACCOUNT ROOM BOT")
     print("=" * 60)
     print(f"Logging in {len(pool)} accounts...")
     print("=" * 60 + "\n")
 
     Thread(target=run_flask, daemon=True).start()
-    print("API Server started on port 5000\n")
+    print("API Server started on port 5000 (Developer: NIROB BBZ)\n")
 
-    # Batched: firing dozens of auth requests at once gets rate limited
     for i in range(0, len(pool), LOGIN_BATCH_SIZE):
         batch = pool[i:i + LOGIN_BATCH_SIZE]
         results = await asyncio.gather(
@@ -1170,6 +1104,7 @@ async def MaiiiinE():
 
     print("\n" + "=" * 60)
     print(f"ACCOUNTS LOGGED IN: {len(SESSIONS)}/{len(pool)}")
+    print("DEVELOPER: NIROB BBZ")
     print("=" * 60)
     print("API: http://0.0.0.0:5000")
     print("  /join?room=123456&password=0000   -> all bots join")
